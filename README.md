@@ -6,6 +6,11 @@ Start a task, walk away. Your phone/watch rings when Claude is done, stuck, or n
 
 <img src="./call-me-comic-min.png" width="800" alt="CallMe comic strip">
 
+> **Setting this up with an AI agent?** Point it at [SETUP.md](./SETUP.md) — an
+> agent-executable runbook that installs the plugin, collects and validates every
+> credential, writes the config, and preflights the whole thing before spending a call.
+> Just say: *"Set up CallMe using the SETUP.md in this repo."*
+
 - **Minimal plugin** - Does one thing: call you on the phone. No crazy setups.
 - **Multi-turn conversations** - Talk through decisions naturally.
 - **Works anywhere** - Smartphone, smartwatch, or even landline!
