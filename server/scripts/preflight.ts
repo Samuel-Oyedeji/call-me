@@ -75,6 +75,46 @@ if (provider === 'twilio' && env('CALLME_PHONE_ACCOUNT_SID') && env('CALLME_PHON
   }
 }
 
+// ---------------------------------------------------------------------- Telnyx
+// Telnyx reuses the generic variable names for different values:
+// CALLME_PHONE_AUTH_TOKEN is an API key, CALLME_PHONE_ACCOUNT_SID is a Connection ID.
+if (provider === 'telnyx' && env('CALLME_PHONE_AUTH_TOKEN')) {
+  const headers = { Authorization: `Bearer ${env('CALLME_PHONE_AUTH_TOKEN')}` };
+  try {
+    const r = await fetch('https://api.telnyx.com/v2/phone_numbers?page[size]=1', { headers });
+    add('Telnyx API key valid', r.ok,
+      r.ok ? 'authenticated' : `HTTP ${r.status} — is CALLME_PHONE_AUTH_TOKEN a KEY... API key?`);
+
+    const connectionId = env('CALLME_PHONE_ACCOUNT_SID');
+    if (r.ok && connectionId) {
+      const cr = await fetch(
+        `https://api.telnyx.com/v2/call_control_applications/${encodeURIComponent(connectionId)}`, { headers });
+      const cb: any = await cr.json().catch(() => ({}));
+      add('Telnyx Call Control connection', cr.ok,
+        cr.ok ? `application "${cb?.data?.application_name}"`
+              : `HTTP ${cr.status} — CALLME_PHONE_ACCOUNT_SID must be the Connection ID of a Call Control App`);
+    }
+
+    const num = env('CALLME_PHONE_NUMBER');
+    if (r.ok && num) {
+      const nr = await fetch(
+        `https://api.telnyx.com/v2/phone_numbers?filter[phone_number]=${encodeURIComponent(num)}`, { headers });
+      const nb: any = await nr.json().catch(() => ({}));
+      const found = nb?.data?.[0];
+      add('Telnyx from-number owned + assigned', Boolean(found?.connection_id),
+        found ? `${found.phone_number} connection_id=${found.connection_id || 'UNASSIGNED'}`
+              : `${num} not found on this account`);
+    }
+  } catch (e) {
+    add('Telnyx API key valid', false, String(e).slice(0, 120));
+  }
+
+  if (!env('CALLME_TELNYX_PUBLIC_KEY')) {
+    add('Telnyx webhook signature verification', false,
+      'CALLME_TELNYX_PUBLIC_KEY unset — server will skip verification (recommended, not blocking)');
+  }
+}
+
 // ------------------------------------------------------- OpenAI Realtime (GA)
 if (env('CALLME_OPENAI_API_KEY')) {
   const key = env('CALLME_OPENAI_API_KEY');
@@ -125,7 +165,9 @@ const pad = Math.max(...checks.map((c) => c.name.length));
 console.log('\nCallMe preflight\n' + '='.repeat(pad + 12));
 for (const c of checks) console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name.padEnd(pad)}  ${c.detail}`);
 
-const hard = checks.filter((c) => !c.ok && !c.name.startsWith('Twilio account is full'));
+// Advisories are reported but do not block a call from working.
+const ADVISORY = ['Twilio account is full', 'Telnyx webhook signature verification'];
+const hard = checks.filter((c) => !c.ok && !ADVISORY.some((a) => c.name.startsWith(a)));
 console.log('='.repeat(pad + 12));
 if (hard.length === 0) {
   console.log('Ready. Restart Claude Code if you just edited settings.json, then ask it to call you.\n');

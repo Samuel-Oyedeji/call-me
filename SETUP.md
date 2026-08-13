@@ -11,6 +11,36 @@ If you are a human: you can follow this too, but the README quickstart is friend
 
 ---
 
+## The whole flow at a glance
+
+```mermaid
+flowchart TD
+    A["User: 'Set up CallMe using SETUP.md'"] --> B{"git, bun, claude present?"}
+    B -->|no| B1["Install bun.<br/>Not Claude Code? Stop."]
+    B1 --> C
+    B -->|yes| C["<b>1.</b> Install plugin<br/>marketplace or local clone"]
+    C --> D{"<b>2a.</b> ASK THE USER:<br/>Twilio or Telnyx?"}
+    D -->|Twilio| E1["Account SID + Auth Token<br/>Buy voice number<br/>Enable Geo Permissions<br/>Verify number if trial"]
+    D -->|Telnyx| E2["Create Call Control App<br/>Connection ID + API Key<br/>Assign number to app"]
+    E1 --> F["<b>2b.</b> OpenAI key + ngrok token<br/><i>both providers need these</i>"]
+    E2 --> F
+    F --> G{"<b>3.</b> Agent can edit<br/>~/.claude/settings.json?"}
+    G -->|yes| H["Merge keys into env block"]
+    G -->|no| G2["Print exact block,<br/>wait for user to confirm"]
+    G2 --> H
+    H --> I["<b>4.</b> Fully restart Claude Code<br/><i>env is read at startup only</i>"]
+    I --> J["<b>5.</b> bun run scripts/preflight.ts"]
+    J -->|blocking failure| J1["Fix the one reported issue"]
+    J1 --> J
+    J -->|all pass| K["<b>6.</b> 'Call me and ask how my day is going'"]
+    K --> L["Ring → speak → pause 1.5s →<br/>'One sec, thinking' → reply"]
+```
+
+Every step before the preflight is free. No phone call is placed, and no money is spent,
+until the preflight passes.
+
+---
+
 ## Rules for the agent
 
 Follow these or you will waste the user's money on failed calls.
@@ -25,6 +55,10 @@ Follow these or you will waste the user's money on failed calls.
    permission to edit `settings.json`), print exact copy-paste instructions for the user
    and wait — do not silently skip it and continue.
 5. **Ask for all missing credentials in one message**, not one at a time.
+6. **Ask which phone provider they use before asking for anything else** (Step 2a). The two
+   providers need different accounts and, confusingly, reuse the same variable names for
+   different values. Guessing here produces credentials that look right and fail at call
+   time.
 
 ---
 
@@ -77,27 +111,51 @@ Use an **absolute** path — `~` is not expanded here.
 
 ---
 
+## Step 2a — Ask which phone provider they use
+
+**Ask this before requesting any credentials.** Put it to the user plainly:
+
+> CallMe places the actual phone call through either **Twilio** or **Telnyx**. Which do you
+> have an account with? If you have neither and don't mind, pick Twilio — it's the more
+> common choice and easier to sign up for. Telnyx is roughly 30–50% cheaper per minute if
+> you plan to talk a lot.
+
+Do not assume. The code defaults to `telnyx` while most users assume Twilio, and the two
+providers **reuse the same variable names for completely different values**:
+
+| Variable | If Twilio | If Telnyx |
+|---|---|---|
+| `CALLME_PHONE_ACCOUNT_SID` | Account SID (`AC…`) | **Connection ID** of a Call Control App |
+| `CALLME_PHONE_AUTH_TOKEN` | Auth Token | **API Key** (`KEY…`) |
+
+Credentials from the wrong provider therefore look perfectly valid and fail only when a
+call is attempted. Once they answer, set `CALLME_PHONE_PROVIDER` to `twilio` or `telnyx`
+yourself and follow only that provider's section below.
+
 ## Step 2 — Collect credentials
 
-You need seven values. Ask the user for all of them in a single message, including the
-acquisition steps below so they do not have to go hunting.
+You need seven values. Ask for all the missing ones in a single message, including the
+acquisition steps below so the user does not have to go hunting.
 
 | Variable | What it is |
 |---|---|
-| `CALLME_PHONE_PROVIDER` | `twilio` or `telnyx`. **You set this, not the user** — use `twilio` unless they say otherwise. |
-| `CALLME_PHONE_ACCOUNT_SID` | Twilio Account SID |
-| `CALLME_PHONE_AUTH_TOKEN` | Twilio Auth Token |
-| `CALLME_PHONE_NUMBER` | The Twilio number that calls *out* |
+| `CALLME_PHONE_PROVIDER` | `twilio` or `telnyx` — from Step 2a |
+| `CALLME_PHONE_ACCOUNT_SID` | Twilio Account SID, **or** Telnyx Connection ID |
+| `CALLME_PHONE_AUTH_TOKEN` | Twilio Auth Token, **or** Telnyx API Key |
+| `CALLME_PHONE_NUMBER` | The number that calls *out* |
 | `CALLME_USER_PHONE_NUMBER` | The user's own phone, which will ring |
 | `CALLME_OPENAI_API_KEY` | OpenAI key, for speech-to-text and text-to-speech |
-| `CALLME_NGROK_AUTHTOKEN` | ngrok token, to expose the local server to Twilio |
+| `CALLME_NGROK_AUTHTOKEN` | ngrok token, to expose the local server to the provider |
 
 > `CALLME_PHONE_PROVIDER` is not optional in practice. The code defaults to `telnyx`, and
-> the plugin manifest does not supply a default, so omitting it silently breaks a Twilio
-> setup with a confusing error. Always set it explicitly.
+> the plugin manifest supplies no default, so omitting it silently breaks a Twilio setup
+> with a confusing error. Always set it explicitly.
 
 Both phone numbers must be **E.164**: a `+`, country code, then digits, no spaces or
 dashes. `+14155551234`, `+2348035700479`.
+
+OpenAI and ngrok are required for **both** providers — they handle speech and the public
+tunnel, not the call itself.
 
 ### Getting Twilio credentials
 
@@ -115,6 +173,25 @@ dashes. `+14155551234`, `+2348035700479`.
      or Twilio refuses to call it.
    - Every call opens with a "press any key to execute your code" prompt. That is Twilio,
      not this plugin. Upgrading removes it.
+
+### Getting Telnyx credentials
+
+Skip this if the user chose Twilio.
+
+1. Sign up at <https://telnyx.com/sign-up> and complete verification. Telnyx reviews new
+   accounts before allowing outbound calls — this can take a little time, so start here.
+2. Create a **Call Control Application**: Voice → **Call Control** → Create Application
+   (<https://portal.telnyx.com/#/app/call-control/applications>). Give it any name; the
+   webhook URL is set per-call by CallMe, so leave it blank.
+3. Copy that application's **Connection ID** — this goes in `CALLME_PHONE_ACCOUNT_SID`.
+   It is a numeric ID, *not* a Twilio-style `AC…` string.
+4. Create an **API Key** under API Keys (<https://portal.telnyx.com/#/app/api-keys>). It
+   starts with `KEY…` and goes in `CALLME_PHONE_AUTH_TOKEN`.
+5. Buy a voice-capable number under Numbers → Search & Buy, and **assign it to the Call
+   Control Application** from step 2. An unassigned number will not place calls.
+6. Recommended: copy the **Public Key** from the API Keys page into
+   `CALLME_TELNYX_PUBLIC_KEY`. Without it the server logs a warning and skips webhook
+   signature verification, meaning anyone who finds your tunnel URL could drive it.
 
 ### Getting an OpenAI API key
 
