@@ -312,7 +312,7 @@ Two things to tell the user up front, because both look like bugs and are not:
 |---|---|---|
 | You talk, nothing ever comes back | Speech-to-text never connected. Old versions send the retired `OpenAI-Beta: realtime=v1` header and get closed with `beta_api_shape_disabled` | Upgrade to 1.0.4+ |
 | "An application error has occurred" | Twilio could not fetch TwiML. Check <https://console.twilio.com/us1/monitor/logs/errors> for an `11200` | A `401 Invalid signature` means an ngrok host the code did not whitelist — 1.0.4+ accepts both `.ngrok-free.dev` and `.ngrok-free.app` |
-| Server exits with `ERR_NGROK_108` | More than 3 ngrok tunnels; every Claude session starts one | Close other sessions or upgrade ngrok |
+| `ERR_NGROK_108` / call tools report no tunnel | More than 3 ngrok tunnels; every Claude session starts one | Ask the user whether to close the other sessions themselves or let you run `close_other_callme_sessions`. To keep a session but free its slot, run `/plugin` there and disable CallMe |
 | Call rings, is never answered, times out | Nobody picked up within `CALLME_CONNECT_TIMEOUT_MS` (60s) | Answer faster, or raise it |
 | Cut off mid-sentence | Turn ends after `CALLME_STT_SILENCE_DURATION_MS` (1500ms) | Raise to 2000–2500 |
 | Calls fail to one country only | Twilio Geo Permissions | Enable that country |

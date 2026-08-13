@@ -12,6 +12,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { CallManager, loadServerConfig } from './phone-call.js';
 import { startNgrok, stopNgrok } from './ngrok.js';
+import { findOtherCallMeServers, closeOtherCallMeServers } from './sessions.js';
 import { ensureKokoroRunning } from './providers/tts-kokoro.js';
 import { loadProviderConfig } from './providers/index.js';
 
@@ -50,21 +51,97 @@ async function main() {
     process.exit(1);
   }
 
-  // Start ngrok tunnel pointing at the actual bound port
-  console.error('Starting ngrok tunnel...');
-  let publicUrl: string;
-  try {
-    publicUrl = await startNgrok(actualPort, (newUrl) => {
-      console.error(`[ngrok] Updating public URL to: ${newUrl}`);
-      callManager.setPublicUrl(newUrl);
-    });
-    callManager.setPublicUrl(publicUrl);
-    console.error(`ngrok tunnel: ${publicUrl}`);
-  } catch (error) {
-    console.error('Failed to start ngrok:', error instanceof Error ? error.message : error);
-    await callManager.shutdown();
-    process.exit(1);
-  }
+  // Start ngrok tunnel pointing at the actual bound port.
+  //
+  // A tunnel failure must NOT kill the process. Exiting here means the MCP server
+  // never registers, so the calling agent sees no call tools at all and reports the
+  // capability as simply missing — which tells the user nothing about the real cause.
+  // Stay up instead, and let the call tools explain the problem and offer a fix.
+  let publicUrl: string | null = null;
+  let tunnelError: string | null = null;
+
+  const startTunnel = async (): Promise<boolean> => {
+    console.error('Starting ngrok tunnel...');
+    try {
+      const url = await startNgrok(actualPort, (newUrl) => {
+        console.error(`[ngrok] Updating public URL to: ${newUrl}`);
+        callManager.setPublicUrl(newUrl);
+      });
+      publicUrl = url;
+      callManager.setPublicUrl(url);
+      tunnelError = null;
+      console.error(`ngrok tunnel: ${url}`);
+      return true;
+    } catch (error) {
+      tunnelError = error instanceof Error ? error.message : String(error);
+      publicUrl = null;
+      console.error('Failed to start ngrok:', tunnelError);
+      console.error('Continuing WITHOUT a tunnel. Call tools will report why and how to fix it.');
+      return false;
+    }
+  };
+
+  await startTunnel();
+
+  /** Loud, actionable explanation returned in place of a call. */
+  const noTunnelMessage = (): string => {
+    const others = findOtherCallMeServers();
+    const atLimit = /ERR_NGROK_108|simultaneous/i.test(tunnelError || '');
+
+    const lines = [
+      'CANNOT PLACE CALL - no public tunnel is available.',
+      '',
+      `ngrok reported: ${tunnelError || 'no tunnel established'}`,
+      '',
+    ];
+
+    // Only offer the "close other sessions" route when contention is actually the
+    // cause. Offering it for an invalid authtoken would send the user to shut down
+    // unrelated work that was never the problem.
+    if (!atLimit) {
+      lines.push(
+        'This is NOT the ngrok session limit - closing other Claude sessions will not help.',
+        'Report the ngrok error above to the user and fix that instead. A bad or missing',
+        'CALLME_NGROK_AUTHTOKEN is the usual cause: correct it in the env block of',
+        '~/.claude/settings.json, then fully restart Claude Code so the value is picked up.',
+        '',
+        'Do not attempt another call until the tunnel error is resolved.',
+      );
+      return lines.join('\n');
+    }
+
+    lines.push(
+      "Cause: ngrok's free plan allows 3 simultaneous tunnels, and every open Claude Code",
+      'session starts its own CallMe server with its own tunnel. Other sessions have taken',
+      'every slot, so this session has no webhook URL for the phone provider to call back to.',
+      '',
+      others.length
+        ? `Found ${others.length} other CallMe server(s) running: ${others.map((p) => `pid ${p.pid}`).join(', ')}`
+        : 'No other CallMe servers found on this machine, so the slots are held by ngrok agents\n' +
+          'outside Claude Code. Check https://dashboard.ngrok.com/agents.',
+      '',
+      'ASK THE USER THIS AS AN OPEN QUESTION AND WAIT FOR THEIR ANSWER. Do not decide for them:',
+      '',
+      '  "You have multiple Claude sessions open and they have used up all your ngrok tunnels,',
+      '   so I have no webhook and cannot place the call. You can close some of those sessions',
+      '   yourself, or I can close them for you from here. Which would you prefer?"',
+      '',
+      'If they want to handle it themselves, any of these works:',
+      '  - Quit one of the other Claude Code sessions entirely; or',
+      '  - Keep that session open but turn CallMe off in it: run /plugin in that session,',
+      '    select CallMe, and disable it. That frees its tunnel without losing any work; or',
+      '  - Upgrade the ngrok plan to lift the 3-tunnel limit.',
+      '  Then restart THIS session so it picks up the freed slot.',
+      '',
+      'If they want you to do it, call the close_other_callme_sessions tool. It stops only the',
+      'other CallMe servers - it does not close those Claude sessions or touch their work - and',
+      'then retries the tunnel here.',
+      '',
+      'Do not attempt another call until one of those has happened.',
+    );
+
+    return lines.join('\n');
+  };
 
   // Create stdio MCP server
   const mcpServer = new Server(
@@ -126,6 +203,14 @@ async function main() {
             required: ['call_id', 'message'],
           },
         },
+        {
+          name: 'close_other_callme_sessions',
+          description:
+            'Free an ngrok tunnel slot by stopping CallMe servers belonging to OTHER Claude sessions, then retry this session\'s tunnel. ' +
+            'Only call this after the user has explicitly agreed to it. It stops the other CallMe servers only - it does not close ' +
+            'those Claude Code sessions or affect their work, though calling will stop working in them until they restart.',
+          inputSchema: { type: 'object', properties: {} },
+        },
       ],
     };
   });
@@ -133,6 +218,46 @@ async function main() {
   // Handle tool calls
   mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
+      if (request.params.name === 'close_other_callme_sessions') {
+        const { stopped, failed } = closeOtherCallMeServers();
+
+        if (stopped.length === 0 && failed.length === 0) {
+          return {
+            content: [{
+              type: 'text',
+              text: 'No other CallMe servers were running, so no tunnel slot was freed.\n\n' +
+                    `The tunnel is still unavailable: ${tunnelError || 'unknown reason'}\n\n` +
+                    'The limit is likely held by ngrok agents outside Claude Code, or the authtoken is invalid. ' +
+                    'Tell the user to check https://dashboard.ngrok.com/agents for active sessions.',
+            }],
+            isError: true,
+          };
+        }
+
+        // Give the stopped servers a moment to release their tunnels.
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const recovered = await startTunnel();
+
+        const report = [
+          `Stopped ${stopped.length} other CallMe server(s): ${stopped.map((p) => `pid ${p}`).join(', ')}`,
+          ...(failed.length ? [`Could not stop: ${failed.map((f) => `pid ${f.pid} (${f.reason})`).join(', ')}`] : []),
+          '',
+          recovered
+            ? 'Tunnel established. You can place the call now.'
+            : `Still no tunnel: ${tunnelError}\nTell the user, and do not retry blindly.`,
+          '',
+          'Calling is now disabled in those other sessions until each one is restarted.',
+        ].join('\n');
+
+        return { content: [{ type: 'text', text: report }], isError: !recovered };
+      }
+
+      // Every call tool needs a public URL for the phone provider to reach back to.
+      const needsTunnel = ['initiate_call', 'continue_call', 'speak_to_user', 'end_call'];
+      if (needsTunnel.includes(request.params.name) && !publicUrl) {
+        return { content: [{ type: 'text', text: noTunnelMessage() }], isError: true };
+      }
+
       if (request.params.name === 'initiate_call') {
         const { message } = request.params.arguments as { message: string };
         const result = await callManager.initiateCall(message);

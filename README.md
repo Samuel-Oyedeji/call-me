@@ -287,9 +287,13 @@ Twilio: ngrok free tier rewrites the request so the HMAC can never match, and re
 before 1.0.4 only whitelisted `.ngrok-free.dev` hosts while ngrok now also issues
 `.ngrok-free.app`.
 
-**The server exits at startup with `ERR_NGROK_108`.**
+**`ERR_NGROK_108` — no tunnel available.**
 ngrok's free plan allows 3 simultaneous agent sessions, and every Claude Code session
-starts its own CallMe server with its own tunnel. Close other sessions or upgrade ngrok.
+starts its own CallMe server with its own tunnel, so a 4th session has nowhere to put its
+webhook. Since 1.0.4 the server no longer exits when this happens — it stays up and the
+call tools explain the cause, name the other running servers, and ask whether you want to
+close them yourself or have Claude do it via `close_other_callme_sessions`. To free a slot
+without losing a session's work, run `/plugin` in that session and disable CallMe.
 
 **It cuts you off mid-sentence.**
 Raise `CALLME_STT_SILENCE_DURATION_MS` (default 1500). This is how many milliseconds of
