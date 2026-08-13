@@ -62,10 +62,11 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
     return new Promise((resolve, reject) => {
       const url = 'wss://api.openai.com/v1/realtime?intent=transcription';
 
+      // GA shape: the Realtime Beta API was retired and now closes the socket with
+      // beta_api_shape_disabled if the OpenAI-Beta header is sent.
       this.ws = new WebSocket(url, {
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
-          'OpenAI-Beta': 'realtime=v1',
         },
       });
 
@@ -76,17 +77,22 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
 
         // Configure the transcription session
         this.sendEvent({
-          type: 'transcription_session.update',
+          type: 'session.update',
           session: {
-            input_audio_format: 'g711_ulaw',
-            input_audio_transcription: {
-              model: this.model,
-            },
-            turn_detection: {
-              type: 'server_vad',
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              silence_duration_ms: this.silenceDurationMs,
+            type: 'transcription',
+            audio: {
+              input: {
+                format: { type: 'audio/pcmu' },
+                transcription: {
+                  model: this.model,
+                },
+                turn_detection: {
+                  type: 'server_vad',
+                  threshold: 0.5,
+                  prefix_padding_ms: 300,
+                  silence_duration_ms: this.silenceDurationMs,
+                },
+              },
             },
           },
         });
@@ -159,6 +165,8 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
 
   private handleEvent(event: any): void {
     switch (event.type) {
+      case 'session.created':
+      case 'session.updated':
       case 'transcription_session.created':
       case 'transcription_session.updated':
         console.error(`[RealtimeSTT] ${event.type}`);
