@@ -263,6 +263,47 @@ bun run dev
 
 ---
 
+## Troubleshooting
+
+Symptoms seen in the wild, and what actually causes them.
+
+**You answer, you talk, and nothing ever comes back (no reply, no error).**
+Speech recognition never connected. OpenAI retired the Realtime *Beta* API, so a client
+sending the `OpenAI-Beta: realtime=v1` header gets the socket closed immediately with
+`beta_api_shape_disabled`. Nothing is transcribed, and the server waits out its full
+3-minute transcript timeout while you hear silence. Fixed in 1.0.4 by moving to the GA
+session shape. If you are on an older version, upgrade.
+
+**The call connects, then says "an application error has occurred".**
+Twilio could not fetch TwiML from your tunnel. Check the Twilio alert log at
+<https://www.twilio.com/console/monitor/logs/errors> for an `11200` naming your ngrok
+`/twiml` URL. A `401 Invalid signature` there means webhook signature validation rejected
+Twilio: ngrok free tier rewrites the request so the HMAC can never match, and releases
+before 1.0.4 only whitelisted `.ngrok-free.dev` hosts while ngrok now also issues
+`.ngrok-free.app`.
+
+**The server exits at startup with `ERR_NGROK_108`.**
+ngrok's free plan allows 3 simultaneous agent sessions, and every Claude Code session
+starts its own CallMe server with its own tunnel. Close other sessions or upgrade ngrok.
+
+**It cuts you off mid-sentence.**
+Raise `CALLME_STT_SILENCE_DURATION_MS` (default 1500). This is how many milliseconds of
+silence ends your turn.
+
+**Long silence after you speak, before Claude answers.**
+Expected: the transcript goes back to the model as a tool result and the reply takes a
+full round-trip. Since 1.0.4 the server speaks `CALLME_ACK_MESSAGE`
+("One sec, thinking.") the moment your speech is transcribed, so you know it landed. Set
+it to an empty string to disable. Note that anything you say *during* that gap is
+discarded — the server only listens between turns.
+
+**Every call logs a Twilio `21626 invalid statusCallbackEvents` warning.**
+Harmless. The status callback events are sent space-joined rather than as repeated
+parameters.
+
+**Twilio trial accounts** play a "press any key to execute your code" prompt before your
+TwiML runs. That gate counts against `CALLME_CONNECT_TIMEOUT_MS` (default 60000).
+
 ## License
 
 MIT

@@ -14,7 +14,7 @@ export class OpenAIRealtimeSTTProvider implements RealtimeSTTProvider {
   readonly name = 'openai-realtime';
   private apiKey: string | null = null;
   private model: string = 'gpt-4o-transcribe';
-  private silenceDurationMs: number = 800;
+  private silenceDurationMs: number = 1500;
 
   initialize(config: STTConfig): void {
     if (!config.apiKey) {
@@ -22,7 +22,7 @@ export class OpenAIRealtimeSTTProvider implements RealtimeSTTProvider {
     }
     this.apiKey = config.apiKey;
     this.model = config.model || 'gpt-4o-transcribe';
-    this.silenceDurationMs = config.silenceDurationMs || 800;
+    this.silenceDurationMs = config.silenceDurationMs || 1500;
     console.error(`STT provider: OpenAI Realtime (${this.model}, silence: ${this.silenceDurationMs}ms)`);
   }
 

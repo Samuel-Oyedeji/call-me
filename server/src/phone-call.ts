@@ -37,6 +37,8 @@ export interface ServerConfig {
   providers: ProviderRegistry;
   providerConfig: ProviderConfig;  // For webhook signature verification
   transcriptTimeoutMs: number;
+  connectTimeoutMs: number;
+  ackMessage: string;
 }
 
 export function loadServerConfig(publicUrl: string): ServerConfig {
@@ -56,6 +58,14 @@ export function loadServerConfig(publicUrl: string): ServerConfig {
   // Default 3 minutes for transcript timeout
   const transcriptTimeoutMs = parseInt(process.env.CALLME_TRANSCRIPT_TIMEOUT_MS || '180000', 10);
 
+  // Default 60 seconds to answer and connect the media stream.
+  // Trial accounts add a "press any key" gate before the stream attaches.
+  const connectTimeoutMs = parseInt(process.env.CALLME_CONNECT_TIMEOUT_MS || '60000', 10);
+
+  // Spoken the moment a transcript lands, so the caller knows their message
+  // registered while the model generates its reply. Set empty to disable.
+  const ackMessage = process.env.CALLME_ACK_MESSAGE ?? 'One sec, thinking.';
+
   return {
     publicUrl,
     port: parseInt(process.env.CALLME_PORT || '0', 10),
@@ -64,6 +74,8 @@ export function loadServerConfig(publicUrl: string): ServerConfig {
     providers,
     providerConfig,
     transcriptTimeoutMs,
+    connectTimeoutMs,
+    ackMessage,
   };
 }
 
@@ -125,7 +137,7 @@ export class CallManager {
           console.error(`[Security] WebSocket token validated for call ${callId}`);
         } else if (!callId) {
           // Token missing or not found - only allow fallback for ngrok free tier
-          const isNgrokFreeTier = new URL(this.config.publicUrl).hostname.endsWith('.ngrok-free.dev');
+          const isNgrokFreeTier = /\.ngrok-free\.(dev|app)$/.test(new URL(this.config.publicUrl).hostname);
           if (isNgrokFreeTier) {
             // Fallback: find the most recent active call (ngrok compatibility mode)
             // Token lookup can fail due to timing issues with ngrok's free tier
@@ -294,7 +306,7 @@ export class CallManager {
           const webhookUrl = `${this.config.publicUrl}/twiml`;
 
           if (!validateTwilioSignature(authToken, signature, webhookUrl, params)) {
-            const isNgrokFreeTier = new URL(this.config.publicUrl).hostname.endsWith('.ngrok-free.dev');
+            const isNgrokFreeTier = /\.ngrok-free\.(dev|app)$/.test(new URL(this.config.publicUrl).hostname);
             if (isNgrokFreeTier) {
               // Only log if ngrok free tier is used
               // Log for debugging but proceed anyway - ngrok free tier causes signature mismatches
@@ -478,8 +490,12 @@ export class CallManager {
       // Start TTS generation in parallel with waiting for connection
       // This reduces latency by generating audio while Twilio establishes the stream
       const ttsPromise = this.generateTTSAudio(message);
+      // Mark as handled so a TTS failure during waitForConnection cannot fire
+      // unhandledRejection and kill the process. The rejection still surfaces
+      // at the `await ttsPromise` below, where the tool handler reports it.
+      ttsPromise.catch(() => {});
 
-      await this.waitForConnection(callId, 15000);
+      await this.waitForConnection(callId, this.config.connectTimeoutMs);
 
       // Send the pre-generated audio and listen for response
       const audioData = await ttsPromise;
@@ -713,6 +729,14 @@ export class CallManager {
     }
 
     console.error(`[${state.callId}] User said: ${transcript}`);
+
+    // Acknowledge immediately. The transcript is returned to the model as a tool
+    // result, and generating the reply takes a full round-trip; without this the
+    // caller hears dead air and assumes the call has broken.
+    if (this.config.ackMessage) {
+      await this.speak(state, this.config.ackMessage);
+    }
+
     return transcript;
   }
 

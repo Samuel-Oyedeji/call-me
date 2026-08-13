@@ -1,6 +1,6 @@
 {
   "name": "callme",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Claude calls you on the phone when it needs your input or wants to report progress",
   "author": {
     "name": "ZeframLou",
@@ -24,7 +24,7 @@
         "CALLME_NGROK_AUTHTOKEN": "${CALLME_NGROK_AUTHTOKEN}",
         "CALLME_PORT": "${CALLME_PORT:-0}",
         "CALLME_TRANSCRIPT_TIMEOUT_MS": "${CALLME_TRANSCRIPT_TIMEOUT_MS:-180000}",
-        "CALLME_STT_SILENCE_DURATION_MS": "${CALLME_STT_SILENCE_DURATION_MS:-800}",
+        "CALLME_STT_SILENCE_DURATION_MS": "${CALLME_STT_SILENCE_DURATION_MS:-1500}",
         "CALLME_TTS_PROVIDER": "${CALLME_TTS_PROVIDER:-openai}",
         "CALLME_KOKORO_URL": "${CALLME_KOKORO_URL:-}"
       }

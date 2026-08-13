@@ -1,0 +1,330 @@
+From 0d6c33077374421058658cc0279b090e19860d2e Mon Sep 17 00:00:00 2001
+From: samuel oyedeji <oyedejisamuel05@gmail.com>
+Date: Thu, 13 Aug 2026 04:07:23 +0100
+Subject: [PATCH 1/2] fix: migrate STT to the OpenAI Realtime GA API
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+OpenAI retired the Realtime Beta API. Sending the `OpenAI-Beta: realtime=v1`
+header now gets the socket closed immediately with `beta_api_shape_disabled`,
+so no audio is ever transcribed. The call still connects and the caller still
+hears Claude speak, but nothing they say comes back — `waitForTranscript` just
+waits out its full 3 minute timeout in silence. This breaks every conversation
+on every install.
+
+Drop the beta header and use the GA session shape: `session.update` with
+`session.type = 'transcription'` and the format, transcription and
+turn_detection options nested under `session.audio.input`. The endpoint is
+unchanged, and so are the transcript event names, so `handleEvent` only needed
+the GA session lifecycle cases adding alongside the beta ones.
+
+Verified end to end against the live API: synthesized speech encoded as g711
+ulaw produced `input_audio_buffer.speech_started`, `.speech_stopped`,
+`.committed`, then `conversation.item.input_audio_transcription.completed`
+carrying the exact phrase.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ server/src/providers/stt-openai-realtime.ts | 30 +++++++++++++--------
+ 1 file changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/server/src/providers/stt-openai-realtime.ts b/server/src/providers/stt-openai-realtime.ts
+index fd8010d..4d00b06 100644
+--- a/server/src/providers/stt-openai-realtime.ts
++++ b/server/src/providers/stt-openai-realtime.ts
+@@ -62,10 +62,11 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
+     return new Promise((resolve, reject) => {
+       const url = 'wss://api.openai.com/v1/realtime?intent=transcription';
+ 
++      // GA shape: the Realtime Beta API was retired and now closes the socket with
++      // beta_api_shape_disabled if the OpenAI-Beta header is sent.
+       this.ws = new WebSocket(url, {
+         headers: {
+           'Authorization': `Bearer ${this.apiKey}`,
+-          'OpenAI-Beta': 'realtime=v1',
+         },
+       });
+ 
+@@ -76,17 +77,22 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
+ 
+         // Configure the transcription session
+         this.sendEvent({
+-          type: 'transcription_session.update',
++          type: 'session.update',
+           session: {
+-            input_audio_format: 'g711_ulaw',
+-            input_audio_transcription: {
+-              model: this.model,
+-            },
+-            turn_detection: {
+-              type: 'server_vad',
+-              threshold: 0.5,
+-              prefix_padding_ms: 300,
+-              silence_duration_ms: this.silenceDurationMs,
++            type: 'transcription',
++            audio: {
++              input: {
++                format: { type: 'audio/pcmu' },
++                transcription: {
++                  model: this.model,
++                },
++                turn_detection: {
++                  type: 'server_vad',
++                  threshold: 0.5,
++                  prefix_padding_ms: 300,
++                  silence_duration_ms: this.silenceDurationMs,
++                },
++              },
+             },
+           },
+         });
+@@ -159,6 +165,8 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
+ 
+   private handleEvent(event: any): void {
+     switch (event.type) {
++      case 'session.created':
++      case 'session.updated':
+       case 'transcription_session.created':
+       case 'transcription_session.updated':
+         console.error(`[RealtimeSTT] ${event.type}`);
+-- 
+2.51.0
+
+
+From 486625204658d9bc1348df350e5ccc3ebe6425eb Mon Sep 17 00:00:00 2001
+From: samuel oyedeji <oyedejisamuel05@gmail.com>
+Date: Thu, 13 Aug 2026 04:07:23 +0100
+Subject: [PATCH 2/2] fix: accept .ngrok-free.app, ack transcripts, widen
+ silence window
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three fixes that together make a free-tier ngrok setup usable.
+
+Accept `.ngrok-free.app` hosts, not just `.ngrok-free.dev`. ngrok issues both,
+and the signature-validation bypass and WebSocket token fallback both keyed on
+`.dev` only. On a `.app` tunnel Twilio's webhook is rejected with
+`401 Invalid signature`, which the caller hears as "an application error has
+occurred" and Twilio logs as an 11200.
+
+Speak an acknowledgement as soon as a transcript lands. The transcript goes back
+to the model as a tool result and the reply costs a full round-trip, so the
+caller sits in dead air and concludes the call has broken — often hanging up,
+which discards what they just said. This has to be server-side: an ack driven by
+the model would arrive after the latency it exists to cover. Configurable via
+`CALLME_ACK_MESSAGE`, empty to disable.
+
+Raise the default silence window from 800ms to 1500ms. 800ms ends the turn
+during an ordinary mid-sentence pause.
+
+Also documents the tunables in .env.example and adds a README troubleshooting
+section covering these symptoms plus ngrok's 3-tunnel limit and the Twilio trial
+gate.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ .claude-plugin/marketplace.json |  2 +-
+ .claude-plugin/plugin.json      |  4 ++--
+ .env.example                    | 15 ++++++++++++
+ README.md                       | 41 +++++++++++++++++++++++++++++++++
+ server/src/phone-call.ts        | 30 +++++++++++++++++++++---
+ 5 files changed, 86 insertions(+), 6 deletions(-)
+
+diff --git a/.claude-plugin/marketplace.json b/.claude-plugin/marketplace.json
+index 0e1c0c4..7059b47 100644
+--- a/.claude-plugin/marketplace.json
++++ b/.claude-plugin/marketplace.json
+@@ -7,7 +7,7 @@
+     {
+       "name": "callme",
+       "description": "Claude calls you on the phone when it needs your input or wants to report progress",
+-      "version": "1.0.3",
++      "version": "1.0.4",
+       "author": {
+         "name": "ZeframLou",
+         "url": "https://github.com/ZeframLou"
+diff --git a/.claude-plugin/plugin.json b/.claude-plugin/plugin.json
+index 31603f7..b0ad3a5 100644
+--- a/.claude-plugin/plugin.json
++++ b/.claude-plugin/plugin.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "callme",
+-  "version": "1.0.3",
++  "version": "1.0.4",
+   "description": "Claude calls you on the phone when it needs your input or wants to report progress",
+   "author": {
+     "name": "ZeframLou",
+@@ -24,7 +24,7 @@
+         "CALLME_NGROK_AUTHTOKEN": "${CALLME_NGROK_AUTHTOKEN}",
+         "CALLME_PORT": "${CALLME_PORT:-0}",
+         "CALLME_TRANSCRIPT_TIMEOUT_MS": "${CALLME_TRANSCRIPT_TIMEOUT_MS:-180000}",
+-        "CALLME_STT_SILENCE_DURATION_MS": "${CALLME_STT_SILENCE_DURATION_MS:-800}",
++        "CALLME_STT_SILENCE_DURATION_MS": "${CALLME_STT_SILENCE_DURATION_MS:-1500}",
+         "CALLME_TTS_PROVIDER": "${CALLME_TTS_PROVIDER:-openai}",
+         "CALLME_KOKORO_URL": "${CALLME_KOKORO_URL:-}"
+       }
+diff --git a/.env.example b/.env.example
+index 622d00f..69e2070 100644
+--- a/.env.example
++++ b/.env.example
+@@ -42,3 +42,18 @@ CALLME_NGROK_AUTHTOKEN=your_ngrok_authtoken
+ # ===================
+ # Local HTTP port for webhooks (default: 3333)
+ # CALLME_PORT=3333
++
++# Milliseconds of silence that ends your speaking turn (default: 1500).
++# Raise it if you get cut off mid-sentence.
++# CALLME_STT_SILENCE_DURATION_MS=1500
++
++# Spoken as soon as your speech is transcribed, so you know it landed while
++# Claude composes a reply. Set to an empty string to disable.
++# CALLME_ACK_MESSAGE=One sec, thinking.
++
++# How long to wait for you to answer and for the media stream to attach
++# (default: 60000). Twilio trial accounts add a "press any key" gate here.
++# CALLME_CONNECT_TIMEOUT_MS=60000
++
++# How long to wait for you to say something before giving up (default: 180000).
++# CALLME_TRANSCRIPT_TIMEOUT_MS=180000
+diff --git a/README.md b/README.md
+index 0c7bfbc..c2a1df8 100644
+--- a/README.md
++++ b/README.md
+@@ -263,6 +263,47 @@ bun run dev
+ 
+ ---
+ 
++## Troubleshooting
++
++Symptoms seen in the wild, and what actually causes them.
++
++**You answer, you talk, and nothing ever comes back (no reply, no error).**
++Speech recognition never connected. OpenAI retired the Realtime *Beta* API, so a client
++sending the `OpenAI-Beta: realtime=v1` header gets the socket closed immediately with
++`beta_api_shape_disabled`. Nothing is transcribed, and the server waits out its full
++3-minute transcript timeout while you hear silence. Fixed in 1.0.4 by moving to the GA
++session shape. If you are on an older version, upgrade.
++
++**The call connects, then says "an application error has occurred".**
++Twilio could not fetch TwiML from your tunnel. Check the Twilio alert log at
++<https://www.twilio.com/console/monitor/logs/errors> for an `11200` naming your ngrok
++`/twiml` URL. A `401 Invalid signature` there means webhook signature validation rejected
++Twilio: ngrok free tier rewrites the request so the HMAC can never match, and releases
++before 1.0.4 only whitelisted `.ngrok-free.dev` hosts while ngrok now also issues
++`.ngrok-free.app`.
++
++**The server exits at startup with `ERR_NGROK_108`.**
++ngrok's free plan allows 3 simultaneous agent sessions, and every Claude Code session
++starts its own CallMe server with its own tunnel. Close other sessions or upgrade ngrok.
++
++**It cuts you off mid-sentence.**
++Raise `CALLME_STT_SILENCE_DURATION_MS` (default 1500). This is how many milliseconds of
++silence ends your turn.
++
++**Long silence after you speak, before Claude answers.**
++Expected: the transcript goes back to the model as a tool result and the reply takes a
++full round-trip. Since 1.0.4 the server speaks `CALLME_ACK_MESSAGE`
++("One sec, thinking.") the moment your speech is transcribed, so you know it landed. Set
++it to an empty string to disable. Note that anything you say *during* that gap is
++discarded — the server only listens between turns.
++
++**Every call logs a Twilio `21626 invalid statusCallbackEvents` warning.**
++Harmless. The status callback events are sent space-joined rather than as repeated
++parameters.
++
++**Twilio trial accounts** play a "press any key to execute your code" prompt before your
++TwiML runs. That gate counts against `CALLME_CONNECT_TIMEOUT_MS` (default 60000).
++
+ ## License
+ 
+ MIT
+diff --git a/server/src/phone-call.ts b/server/src/phone-call.ts
+index 7a3e9f0..7aecb38 100644
+--- a/server/src/phone-call.ts
++++ b/server/src/phone-call.ts
+@@ -37,6 +37,8 @@ export interface ServerConfig {
+   providers: ProviderRegistry;
+   providerConfig: ProviderConfig;  // For webhook signature verification
+   transcriptTimeoutMs: number;
++  connectTimeoutMs: number;
++  ackMessage: string;
+ }
+ 
+ export function loadServerConfig(publicUrl: string): ServerConfig {
+@@ -56,6 +58,14 @@ export function loadServerConfig(publicUrl: string): ServerConfig {
+   // Default 3 minutes for transcript timeout
+   const transcriptTimeoutMs = parseInt(process.env.CALLME_TRANSCRIPT_TIMEOUT_MS || '180000', 10);
+ 
++  // Default 60 seconds to answer and connect the media stream.
++  // Trial accounts add a "press any key" gate before the stream attaches.
++  const connectTimeoutMs = parseInt(process.env.CALLME_CONNECT_TIMEOUT_MS || '60000', 10);
++
++  // Spoken the moment a transcript lands, so the caller knows their message
++  // registered while the model generates its reply. Set empty to disable.
++  const ackMessage = process.env.CALLME_ACK_MESSAGE ?? 'One sec, thinking.';
++
+   return {
+     publicUrl,
+     port: parseInt(process.env.CALLME_PORT || '0', 10),
+@@ -64,6 +74,8 @@ export function loadServerConfig(publicUrl: string): ServerConfig {
+     providers,
+     providerConfig,
+     transcriptTimeoutMs,
++    connectTimeoutMs,
++    ackMessage,
+   };
+ }
+ 
+@@ -125,7 +137,7 @@ export class CallManager {
+           console.error(`[Security] WebSocket token validated for call ${callId}`);
+         } else if (!callId) {
+           // Token missing or not found - only allow fallback for ngrok free tier
+-          const isNgrokFreeTier = new URL(this.config.publicUrl).hostname.endsWith('.ngrok-free.dev');
++          const isNgrokFreeTier = /\.ngrok-free\.(dev|app)$/.test(new URL(this.config.publicUrl).hostname);
+           if (isNgrokFreeTier) {
+             // Fallback: find the most recent active call (ngrok compatibility mode)
+             // Token lookup can fail due to timing issues with ngrok's free tier
+@@ -294,7 +306,7 @@ export class CallManager {
+           const webhookUrl = `${this.config.publicUrl}/twiml`;
+ 
+           if (!validateTwilioSignature(authToken, signature, webhookUrl, params)) {
+-            const isNgrokFreeTier = new URL(this.config.publicUrl).hostname.endsWith('.ngrok-free.dev');
++            const isNgrokFreeTier = /\.ngrok-free\.(dev|app)$/.test(new URL(this.config.publicUrl).hostname);
+             if (isNgrokFreeTier) {
+               // Only log if ngrok free tier is used
+               // Log for debugging but proceed anyway - ngrok free tier causes signature mismatches
+@@ -478,8 +490,12 @@ export class CallManager {
+       // Start TTS generation in parallel with waiting for connection
+       // This reduces latency by generating audio while Twilio establishes the stream
+       const ttsPromise = this.generateTTSAudio(message);
++      // Mark as handled so a TTS failure during waitForConnection cannot fire
++      // unhandledRejection and kill the process. The rejection still surfaces
++      // at the `await ttsPromise` below, where the tool handler reports it.
++      ttsPromise.catch(() => {});
+ 
+-      await this.waitForConnection(callId, 15000);
++      await this.waitForConnection(callId, this.config.connectTimeoutMs);
+ 
+       // Send the pre-generated audio and listen for response
+       const audioData = await ttsPromise;
+@@ -713,6 +729,14 @@ export class CallManager {
+     }
+ 
+     console.error(`[${state.callId}] User said: ${transcript}`);
++
++    // Acknowledge immediately. The transcript is returned to the model as a tool
++    // result, and generating the reply takes a full round-trip; without this the
++    // caller hears dead air and assumes the call has broken.
++    if (this.config.ackMessage) {
++      await this.speak(state, this.config.ackMessage);
++    }
++
+     return transcript;
+   }
+ 
+-- 
+2.51.0
+
