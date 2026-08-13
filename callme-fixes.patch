@@ -56,7 +56,7 @@ index 622d00f..69e2070 100644
 +# How long to wait for you to say something before giving up (default: 180000).
 +# CALLME_TRANSCRIPT_TIMEOUT_MS=180000
 diff --git a/README.md b/README.md
-index 0c7bfbc..9da4573 100644
+index 0c7bfbc..cebd5a3 100644
 --- a/README.md
 +++ b/README.md
 @@ -6,6 +6,11 @@ Start a task, walk away. Your phone/watch rings when Claude is done, stuck, or n
@@ -71,7 +71,7 @@ index 0c7bfbc..9da4573 100644
  - **Minimal plugin** - Does one thing: call you on the phone. No crazy setups.
  - **Multi-turn conversations** - Talk through decisions naturally.
  - **Works anywhere** - Smartphone, smartwatch, or even landline!
-@@ -263,6 +268,47 @@ bun run dev
+@@ -263,6 +268,51 @@ bun run dev
  
  ---
  
@@ -94,9 +94,13 @@ index 0c7bfbc..9da4573 100644
 +before 1.0.4 only whitelisted `.ngrok-free.dev` hosts while ngrok now also issues
 +`.ngrok-free.app`.
 +
-+**The server exits at startup with `ERR_NGROK_108`.**
++**`ERR_NGROK_108` — no tunnel available.**
 +ngrok's free plan allows 3 simultaneous agent sessions, and every Claude Code session
-+starts its own CallMe server with its own tunnel. Close other sessions or upgrade ngrok.
++starts its own CallMe server with its own tunnel, so a 4th session has nowhere to put its
++webhook. Since 1.0.4 the server no longer exits when this happens — it stays up and the
++call tools explain the cause, name the other running servers, and ask whether you want to
++close them yourself or have Claude do it via `close_other_callme_sessions`. To free a slot
++without losing a session's work, run `/plugin` in that session and disable CallMe.
 +
 +**It cuts you off mid-sentence.**
 +Raise `CALLME_STT_SILENCE_DURATION_MS` (default 1500). This is how many milliseconds of
@@ -121,7 +125,7 @@ index 0c7bfbc..9da4573 100644
  MIT
 diff --git a/SETUP.md b/SETUP.md
 new file mode 100644
-index 0000000..79ca56a
+index 0000000..b5cd418
 --- /dev/null
 +++ b/SETUP.md
 @@ -0,0 +1,343 @@
@@ -439,7 +443,7 @@ index 0000000..79ca56a
 +|---|---|---|
 +| You talk, nothing ever comes back | Speech-to-text never connected. Old versions send the retired `OpenAI-Beta: realtime=v1` header and get closed with `beta_api_shape_disabled` | Upgrade to 1.0.4+ |
 +| "An application error has occurred" | Twilio could not fetch TwiML. Check <https://console.twilio.com/us1/monitor/logs/errors> for an `11200` | A `401 Invalid signature` means an ngrok host the code did not whitelist — 1.0.4+ accepts both `.ngrok-free.dev` and `.ngrok-free.app` |
-+| Server exits with `ERR_NGROK_108` | More than 3 ngrok tunnels; every Claude session starts one | Close other sessions or upgrade ngrok |
++| `ERR_NGROK_108` / call tools report no tunnel | More than 3 ngrok tunnels; every Claude session starts one | Ask the user whether to close the other sessions themselves or let you run `close_other_callme_sessions`. To keep a session but free its slot, run `/plugin` there and disable CallMe |
 +| Call rings, is never answered, times out | Nobody picked up within `CALLME_CONNECT_TIMEOUT_MS` (60s) | Answer faster, or raise it |
 +| Cut off mid-sentence | Turn ends after `CALLME_STT_SILENCE_DURATION_MS` (1500ms) | Raise to 2000–2500 |
 +| Calls fail to one country only | Twilio Geo Permissions | Enable that country |
@@ -651,6 +655,193 @@ index 0000000..da8a921
 +}
 +console.log(`${hard.length} blocking issue(s). Fix these before placing a call.\n`);
 +process.exit(1);
+diff --git a/server/src/index.ts b/server/src/index.ts
+index 3fca234..7e93866 100644
+--- a/server/src/index.ts
++++ b/server/src/index.ts
+@@ -12,6 +12,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+ import { CallManager, loadServerConfig } from './phone-call.js';
+ import { startNgrok, stopNgrok } from './ngrok.js';
++import { findOtherCallMeServers, closeOtherCallMeServers } from './sessions.js';
+ import { ensureKokoroRunning } from './providers/tts-kokoro.js';
+ import { loadProviderConfig } from './providers/index.js';
+ 
+@@ -50,21 +51,97 @@ async function main() {
+     process.exit(1);
+   }
+ 
+-  // Start ngrok tunnel pointing at the actual bound port
+-  console.error('Starting ngrok tunnel...');
+-  let publicUrl: string;
+-  try {
+-    publicUrl = await startNgrok(actualPort, (newUrl) => {
+-      console.error(`[ngrok] Updating public URL to: ${newUrl}`);
+-      callManager.setPublicUrl(newUrl);
+-    });
+-    callManager.setPublicUrl(publicUrl);
+-    console.error(`ngrok tunnel: ${publicUrl}`);
+-  } catch (error) {
+-    console.error('Failed to start ngrok:', error instanceof Error ? error.message : error);
+-    await callManager.shutdown();
+-    process.exit(1);
+-  }
++  // Start ngrok tunnel pointing at the actual bound port.
++  //
++  // A tunnel failure must NOT kill the process. Exiting here means the MCP server
++  // never registers, so the calling agent sees no call tools at all and reports the
++  // capability as simply missing — which tells the user nothing about the real cause.
++  // Stay up instead, and let the call tools explain the problem and offer a fix.
++  let publicUrl: string | null = null;
++  let tunnelError: string | null = null;
++
++  const startTunnel = async (): Promise<boolean> => {
++    console.error('Starting ngrok tunnel...');
++    try {
++      const url = await startNgrok(actualPort, (newUrl) => {
++        console.error(`[ngrok] Updating public URL to: ${newUrl}`);
++        callManager.setPublicUrl(newUrl);
++      });
++      publicUrl = url;
++      callManager.setPublicUrl(url);
++      tunnelError = null;
++      console.error(`ngrok tunnel: ${url}`);
++      return true;
++    } catch (error) {
++      tunnelError = error instanceof Error ? error.message : String(error);
++      publicUrl = null;
++      console.error('Failed to start ngrok:', tunnelError);
++      console.error('Continuing WITHOUT a tunnel. Call tools will report why and how to fix it.');
++      return false;
++    }
++  };
++
++  await startTunnel();
++
++  /** Loud, actionable explanation returned in place of a call. */
++  const noTunnelMessage = (): string => {
++    const others = findOtherCallMeServers();
++    const atLimit = /ERR_NGROK_108|simultaneous/i.test(tunnelError || '');
++
++    const lines = [
++      'CANNOT PLACE CALL - no public tunnel is available.',
++      '',
++      `ngrok reported: ${tunnelError || 'no tunnel established'}`,
++      '',
++    ];
++
++    // Only offer the "close other sessions" route when contention is actually the
++    // cause. Offering it for an invalid authtoken would send the user to shut down
++    // unrelated work that was never the problem.
++    if (!atLimit) {
++      lines.push(
++        'This is NOT the ngrok session limit - closing other Claude sessions will not help.',
++        'Report the ngrok error above to the user and fix that instead. A bad or missing',
++        'CALLME_NGROK_AUTHTOKEN is the usual cause: correct it in the env block of',
++        '~/.claude/settings.json, then fully restart Claude Code so the value is picked up.',
++        '',
++        'Do not attempt another call until the tunnel error is resolved.',
++      );
++      return lines.join('\n');
++    }
++
++    lines.push(
++      "Cause: ngrok's free plan allows 3 simultaneous tunnels, and every open Claude Code",
++      'session starts its own CallMe server with its own tunnel. Other sessions have taken',
++      'every slot, so this session has no webhook URL for the phone provider to call back to.',
++      '',
++      others.length
++        ? `Found ${others.length} other CallMe server(s) running: ${others.map((p) => `pid ${p.pid}`).join(', ')}`
++        : 'No other CallMe servers found on this machine, so the slots are held by ngrok agents\n' +
++          'outside Claude Code. Check https://dashboard.ngrok.com/agents.',
++      '',
++      'ASK THE USER THIS AS AN OPEN QUESTION AND WAIT FOR THEIR ANSWER. Do not decide for them:',
++      '',
++      '  "You have multiple Claude sessions open and they have used up all your ngrok tunnels,',
++      '   so I have no webhook and cannot place the call. You can close some of those sessions',
++      '   yourself, or I can close them for you from here. Which would you prefer?"',
++      '',
++      'If they want to handle it themselves, any of these works:',
++      '  - Quit one of the other Claude Code sessions entirely; or',
++      '  - Keep that session open but turn CallMe off in it: run /plugin in that session,',
++      '    select CallMe, and disable it. That frees its tunnel without losing any work; or',
++      '  - Upgrade the ngrok plan to lift the 3-tunnel limit.',
++      '  Then restart THIS session so it picks up the freed slot.',
++      '',
++      'If they want you to do it, call the close_other_callme_sessions tool. It stops only the',
++      'other CallMe servers - it does not close those Claude sessions or touch their work - and',
++      'then retries the tunnel here.',
++      '',
++      'Do not attempt another call until one of those has happened.',
++    );
++
++    return lines.join('\n');
++  };
+ 
+   // Create stdio MCP server
+   const mcpServer = new Server(
+@@ -126,6 +203,14 @@ async function main() {
+             required: ['call_id', 'message'],
+           },
+         },
++        {
++          name: 'close_other_callme_sessions',
++          description:
++            'Free an ngrok tunnel slot by stopping CallMe servers belonging to OTHER Claude sessions, then retry this session\'s tunnel. ' +
++            'Only call this after the user has explicitly agreed to it. It stops the other CallMe servers only - it does not close ' +
++            'those Claude Code sessions or affect their work, though calling will stop working in them until they restart.',
++          inputSchema: { type: 'object', properties: {} },
++        },
+       ],
+     };
+   });
+@@ -133,6 +218,46 @@ async function main() {
+   // Handle tool calls
+   mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+     try {
++      if (request.params.name === 'close_other_callme_sessions') {
++        const { stopped, failed } = closeOtherCallMeServers();
++
++        if (stopped.length === 0 && failed.length === 0) {
++          return {
++            content: [{
++              type: 'text',
++              text: 'No other CallMe servers were running, so no tunnel slot was freed.\n\n' +
++                    `The tunnel is still unavailable: ${tunnelError || 'unknown reason'}\n\n` +
++                    'The limit is likely held by ngrok agents outside Claude Code, or the authtoken is invalid. ' +
++                    'Tell the user to check https://dashboard.ngrok.com/agents for active sessions.',
++            }],
++            isError: true,
++          };
++        }
++
++        // Give the stopped servers a moment to release their tunnels.
++        await new Promise((resolve) => setTimeout(resolve, 2000));
++        const recovered = await startTunnel();
++
++        const report = [
++          `Stopped ${stopped.length} other CallMe server(s): ${stopped.map((p) => `pid ${p}`).join(', ')}`,
++          ...(failed.length ? [`Could not stop: ${failed.map((f) => `pid ${f.pid} (${f.reason})`).join(', ')}`] : []),
++          '',
++          recovered
++            ? 'Tunnel established. You can place the call now.'
++            : `Still no tunnel: ${tunnelError}\nTell the user, and do not retry blindly.`,
++          '',
++          'Calling is now disabled in those other sessions until each one is restarted.',
++        ].join('\n');
++
++        return { content: [{ type: 'text', text: report }], isError: !recovered };
++      }
++
++      // Every call tool needs a public URL for the phone provider to reach back to.
++      const needsTunnel = ['initiate_call', 'continue_call', 'speak_to_user', 'end_call'];
++      if (needsTunnel.includes(request.params.name) && !publicUrl) {
++        return { content: [{ type: 'text', text: noTunnelMessage() }], isError: true };
++      }
++
+       if (request.params.name === 'initiate_call') {
+         const { message } = request.params.arguments as { message: string };
+         const result = await callManager.initiateCall(message);
 diff --git a/server/src/phone-call.ts b/server/src/phone-call.ts
 index 7a3e9f0..7aecb38 100644
 --- a/server/src/phone-call.ts
@@ -812,3 +1003,90 @@ index fd8010d..8e4f3e4 100644
        case 'transcription_session.created':
        case 'transcription_session.updated':
          console.error(`[RealtimeSTT] ${event.type}`);
+diff --git a/server/src/sessions.ts b/server/src/sessions.ts
+new file mode 100644
+index 0000000..d5e7d33
+--- /dev/null
++++ b/server/src/sessions.ts
+@@ -0,0 +1,81 @@
++/**
++ * Discovery and cleanup of sibling CallMe servers.
++ *
++ * ngrok's free plan allows 3 simultaneous tunnels, and every open Claude Code
++ * session starts its own CallMe server with its own tunnel. Once the limit is
++ * reached, further sessions boot with no public URL and cannot place calls.
++ *
++ * This module finds those sibling servers so the failure can name them, and can
++ * stop them to free a slot. It deliberately targets *only* CallMe server
++ * processes — never Claude Code itself, and never the session's own work.
++ */
++
++import { execFileSync } from 'node:child_process';
++
++export interface CallMeProcess {
++  pid: number;
++  ppid: number;
++  command: string;
++}
++
++/**
++ * A process is ours to manage only if its command line looks like a CallMe
++ * server entrypoint. Both conditions must hold, so an unrelated `index.ts` or a
++ * directory that merely mentions the word cannot match.
++ */
++function looksLikeCallMeServer(command: string): boolean {
++  const inCallMePath = /call[-_]?me/i.test(command);
++  const isServerEntry = /src[/\\]index\.ts|--cwd[^\n]*server|\bserver\b[^\n]*\bstart\b/.test(command);
++  return inCallMePath && isServerEntry;
++}
++
++/** Every CallMe server process on this machine except this one and its wrapper. */
++export function findOtherCallMeServers(): CallMeProcess[] {
++  let raw: string;
++  try {
++    raw = execFileSync('ps', ['-axo', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
++  } catch {
++    return [];
++  }
++
++  const self = process.pid;
++  const parent = process.ppid;
++
++  return raw
++    .split('\n')
++    .map((line) => {
++      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
++      if (!m) return null;
++      return { pid: Number(m[1]), ppid: Number(m[2]), command: m[3] };
++    })
++    .filter((p): p is CallMeProcess => p !== null)
++    // Never target ourselves, our `bun run --cwd ...` wrapper, or our children.
++    .filter((p) => p.pid !== self && p.pid !== parent && p.ppid !== self)
++    .filter((p) => looksLikeCallMeServer(p.command));
++}
++
++export interface CloseResult {
++  stopped: number[];
++  failed: { pid: number; reason: string }[];
++}
++
++/**
++ * Stop sibling CallMe servers, freeing their ngrok tunnels.
++ *
++ * Sends SIGTERM so each server runs its normal shutdown path (hanging up any
++ * live call and closing its tunnel cleanly) rather than being killed outright.
++ */
++export function closeOtherCallMeServers(): CloseResult {
++  const result: CloseResult = { stopped: [], failed: [] };
++
++  for (const proc of findOtherCallMeServers()) {
++    try {
++      process.kill(proc.pid, 'SIGTERM');
++      result.stopped.push(proc.pid);
++    } catch (error) {
++      result.failed.push({ pid: proc.pid, reason: error instanceof Error ? error.message : String(error) });
++    }
++  }
++
++  return result;
++}
